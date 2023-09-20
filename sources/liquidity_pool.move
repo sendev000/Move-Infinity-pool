@@ -355,7 +355,15 @@ module lp_account::liquidity_pool {
         @param admin - signer representing the admin of this module
     */
     fun init_module(admin: &signer) {
-
+        let signer_cap = resource_account::retrieve_resource_account_cap(admin, @overmind);
+        // create and move the State resource  to the resource account.
+        move_to(admin, State {
+            signer_cap: signer_cap,
+            create_liquidity_pool_events: account::new_event_handle<CreateLiquidityPoolEvent>(admin),
+            supply_liquidity_events: account::new_event_handle<SupplyLiquidityEvent>(admin),
+            remove_liquidity_events: account::new_event_handle<RemoveLiquidityEvent>(admin),
+            swap_events: account::new_event_handle<SwapEvent>(admin),
+        });
     }
     
     /* 
@@ -365,7 +373,44 @@ module lp_account::liquidity_pool {
         @type_param CoinB - the type of the second coin for the liquidity pool
     */  
     public entry fun create_liquidity_pool<CoinA, CoinB>() acquires State {
+        assert!(!exists<LiquidityPool<CoinA, CoinB>>(@lp_account), ECodeForAllErrors);
+        assert!(coin::is_coin_initialized<CoinA>(), ECodeForAllErrors);
+        assert!(coin::is_coin_initialized<CoinB>(), ECodeForAllErrors);
+        assert_coin_sorted_and_not_equal<CoinA, CoinB>();
 
+        // Get admin signer
+        let state_mut = borrow_global_mut<State>(@lp_account);
+        let admin = account::create_signer_with_capability(&state_mut.signer_cap);
+        // Initialize LP coin and get capabilities
+        let coin_a_symbol = get_coin_symbol<CoinA>();
+        let coin_b_symbol = get_coin_symbol<CoinB>();
+        let lp_token_name = string_utils::format2(&b"{}-{} LP token", coin::symbol<CoinA>(), coin::symbol<CoinB>());
+        let lp_token_symbol = get_token_symbol(coin_a_symbol, coin_b_symbol);
+        coin::register<LPCoin<CoinA, CoinB>>(&admin);
+        let (burn_cap, freeze_cap, mint_cap) = coin::initialize<LPCoin<CoinA, CoinB>>(
+            &admin,
+            lp_token_name,
+            lp_token_symbol,
+            8,
+            true
+        );
+        coin::destroy_freeze_cap(freeze_cap);
+        // Create liquidity pool and move to admin
+        move_to(&admin, LiquidityPool {
+            coin_a_reserve: coin::zero<CoinA>(),
+            coin_b_reserve: coin::zero<CoinB>(),
+            lp_coin_mint_cap: mint_cap,
+            lp_coin_burn_cap: burn_cap,
+        });
+        event::emit_event<CreateLiquidityPoolEvent>(
+            &mut state_mut.create_liquidity_pool_events,
+            CreateLiquidityPoolEvent {
+                coin_a: coin::name<CoinA>(),
+                coin_b: coin::name<CoinA>(),
+                lp_coin: lp_token_name,
+                creation_timestamp_seconds: timestamp::now_seconds(),
+            }
+        );
     }
 
     /* 
@@ -382,7 +427,44 @@ module lp_account::liquidity_pool {
         coin_a: Coin<CoinA>, 
         coin_b: Coin<CoinB>
     ): Coin<LPCoin<CoinA, CoinB>> acquires State, LiquidityPool {
-        
+        let resource_account_address = @lp_account;
+        let state_mut = borrow_global_mut<State>(resource_account_address);
+        assert_coin_sorted_and_not_equal<CoinA, CoinB>();
+        assert!(exists<LiquidityPool<CoinA, CoinB>>(resource_account_address), ECodeForAllErrors);
+        let lp_coins_total_supply = *option::borrow(&coin::supply<LPCoin<CoinA, CoinB>>());
+        let coin_a_value = coin::value<CoinA>(&coin_a);
+        let coin_b_value = coin::value<CoinB>(&coin_b);
+        let liquidity_pool = borrow_global_mut<LiquidityPool<CoinA, CoinB>>(resource_account_address);
+        let lp_amount: u64;
+        let lp_coin;
+        let amount_coin_a_reserve = coin::value(&liquidity_pool.coin_a_reserve);
+        let amount_coin_b_reserve = coin::value(&liquidity_pool.coin_b_reserve);
+        if (amount_coin_a_reserve == 0 || amount_coin_b_reserve == 0){
+            assert!(math128::sqrt((coin_a_value as u128) * (coin_b_value as u128)) > 1000, ECodeForAllErrors);
+            lp_amount = (math128::sqrt((coin_a_value as u128) * (coin_b_value as u128)) as u64);
+            let lock_coin = coin::mint<LPCoin<CoinA, CoinB>>(1000, &liquidity_pool.lp_coin_mint_cap);
+            coin::deposit<LPCoin<CoinA, CoinB>>(resource_account_address, lock_coin);
+            lp_coin = coin::mint<LPCoin<CoinA, CoinB>>(lp_amount - 1000, &liquidity_pool.lp_coin_mint_cap);
+        } else {
+            lp_amount = math64::min(math64::mul_div(coin_a_value, (lp_coins_total_supply as u64), amount_coin_a_reserve), 
+                    math64::mul_div(coin_b_value, (lp_coins_total_supply as u64), amount_coin_b_reserve));
+            assert!(lp_amount > 0, ECodeForAllErrors);
+            lp_coin = coin::mint<LPCoin<CoinA, CoinB>>(lp_amount, &liquidity_pool.lp_coin_mint_cap);
+        };
+        coin::merge(&mut liquidity_pool.coin_a_reserve, coin_a);
+        coin::merge(&mut liquidity_pool.coin_b_reserve, coin_b);
+        event::emit_event<SupplyLiquidityEvent>(
+            &mut state_mut.supply_liquidity_events,
+            SupplyLiquidityEvent {
+                coin_a: coin::name<CoinA>(),
+                coin_b: coin::name<CoinA>(),
+                amount_a: coin_a_value,
+                amount_b: coin_b_value,
+                lp_amount: lp_amount,
+                creation_timestamp_seconds: timestamp::now_seconds(),
+            }
+        );
+        lp_coin
     }
 
     /* 
@@ -396,7 +478,33 @@ module lp_account::liquidity_pool {
     public fun remove_liquidity<CoinA, CoinB>(
         lp_coins_to_redeem: Coin<LPCoin<CoinA, CoinB>>
     ): (Coin<CoinA>, Coin<CoinB>) acquires State, LiquidityPool {
+        let resource_account_address = @lp_account;
+        let state_mut = borrow_global_mut<State>(resource_account_address);
+        let liquidity_pool = borrow_global_mut<LiquidityPool<CoinA, CoinB>>(resource_account_address);
+        let lp_coins_to_redeem_value = coin::value(&lp_coins_to_redeem);
+        assert!(lp_coins_to_redeem_value > 0, ECodeForAllErrors);
 
+        let lp_coins_total_supply = *option::borrow(&coin::supply<LPCoin<CoinA, CoinB>>());
+        let amount_coin_a_reserve = coin::value(&liquidity_pool.coin_a_reserve);        
+        let amount_coin_b_reserve = coin::value(&liquidity_pool.coin_b_reserve);
+        let amount_coin_a = ((lp_coins_to_redeem_value as u128) * (amount_coin_a_reserve as u128)/ lp_coins_total_supply as u64);
+        let amount_coin_b = ((lp_coins_to_redeem_value as u128) * (amount_coin_b_reserve as u128)/ lp_coins_total_supply as u64);
+
+        coin::burn<LPCoin<CoinA, CoinB>>(lp_coins_to_redeem, &liquidity_pool.lp_coin_burn_cap);
+        let coin_a = coin::extract(&mut liquidity_pool.coin_a_reserve, amount_coin_a);
+        let coin_b = coin::extract(&mut liquidity_pool.coin_b_reserve, amount_coin_b);
+        event::emit_event<RemoveLiquidityEvent>(
+            &mut state_mut.remove_liquidity_events,
+            RemoveLiquidityEvent {
+                coin_a: coin::name<CoinA>(),
+                coin_b: coin::name<CoinA>(),
+                lp_amount: lp_coins_to_redeem_value,
+                amount_a: amount_coin_a,
+                amount_b: amount_coin_b,
+                creation_timestamp_seconds: timestamp::now_seconds(),
+            }
+        );
+        (coin_a, coin_b)
     }
 
     /* 
@@ -418,17 +526,66 @@ module lp_account::liquidity_pool {
         coin_b_in: Coin<CoinB>,
         amount_coin_b_out: u64
     ): (Coin<CoinA>, Coin<CoinB>) acquires State, LiquidityPool {
-        
+        let resource_account_address = @lp_account;
+        let state_mut = borrow_global_mut<State>(resource_account_address);       
+        assert_coin_sorted_and_not_equal<CoinA, CoinB>();
+        assert!(exists<LiquidityPool<CoinA, CoinB>>(resource_account_address), ECodeForAllErrors);
+        let liquidity_pool = borrow_global_mut<LiquidityPool<CoinA, CoinB>>(resource_account_address);
+        let amount_coin_a_reserve = coin::value(&liquidity_pool.coin_a_reserve);
+        let amount_coin_b_reserve = coin::value(&liquidity_pool.coin_b_reserve);
+        let lp_constant = amount_coin_a_reserve * amount_coin_b_reserve;
+        let amount_coin_a_in = coin::value(&coin_a_in);
+        let amount_coin_b_in = coin::value(&coin_b_in);
+        assert!(amount_coin_a_in + amount_coin_b_in > 0, ECodeForAllErrors);
+        let updated_lp_constant = (amount_coin_a_reserve + amount_coin_a_in - amount_coin_a_out) * (amount_coin_b_reserve + amount_coin_b_in - amount_coin_b_out);
+        assert!(updated_lp_constant >= lp_constant, ECodeForAllErrors);
+        coin::merge(&mut liquidity_pool.coin_a_reserve, coin_a_in);
+        coin::merge(&mut liquidity_pool.coin_b_reserve, coin_b_in);
+        let coin_a = coin::extract(&mut liquidity_pool.coin_a_reserve, amount_coin_a_out);
+        let coin_b = coin::extract(&mut liquidity_pool.coin_b_reserve, amount_coin_b_out);
+        event::emit_event<SwapEvent>(
+            &mut state_mut.swap_events,
+            SwapEvent {
+                coin_a: coin::name<CoinA>(),
+                coin_b: coin::name<CoinA>(),
+                amount_coin_a_in: amount_coin_a_in,
+                amount_coin_a_out: amount_coin_a_out,
+                amount_coin_b_in: amount_coin_b_in,
+                amount_coin_b_out: amount_coin_b_out,
+                creation_timestamp_seconds: timestamp::now_seconds(),
+            }
+        );
+        (coin_a, coin_b)
     }
 
     //==============================================================================================
     // Helper functions
     //==============================================================================================
-
+    inline fun get_coin_symbol<CoinA>(): String {
+        let len = string::length(&coin::symbol<CoinA>());
+        if(len >= 6) {
+            string::sub_string(&coin::symbol<CoinA>(), 0, 4)
+        } else {
+            string::sub_string(&coin::symbol<CoinA>(), 0, len)
+        }
+    }
+    inline fun get_token_symbol(coin_a_symbol: String, coin_b_symbol: String): String {
+        let token_symbol = string::utf8(b"");
+        string::append(&mut token_symbol, coin_a_symbol);
+        string::append_utf8(&mut token_symbol, b"-");
+        string::append(&mut token_symbol, coin_b_symbol);
+        token_symbol
+    }
     //==============================================================================================
     // Validation functions
     //==============================================================================================
-
+    inline fun assert_coin_sorted_and_not_equal<CoinA, CoinB>() {
+        let coin_1 = type_info::type_name<CoinA>();
+        let coin_2 = type_info::type_name<CoinB>();
+        let result: Result = comparator::compare(&coin_1, &coin_2);
+        assert!(comparator::is_smaller_than(&result), ECodeForAllErrors);
+        assert!(!comparator::is_equal(&result), ECodeForAllErrors);
+    }
     //==============================================================================================
     // Tests - DO NOT MODIFY
     //==============================================================================================
@@ -1302,11 +1459,11 @@ module lp_account::liquidity_pool {
             option::is_some(&coin::supply<LPCoin<AptosCoin, TestCoin2>>()),
             0
         );
+
         assert!(
             option::contains(&coin::supply<LPCoin<AptosCoin, TestCoin2>>(), &1000000),
             0
         );
-
         assert!(
             coin::value<LPCoin<AptosCoin, TestCoin2>>(&lp_coins) == 1000000 - 1000,
             0
@@ -3190,7 +3347,6 @@ module lp_account::liquidity_pool {
         let coin_a_in = coin::zero<TestCoin1>();
         let amount_coin_a_out = 6 * math64::pow(10, (TEST_COIN1_DECIMALS as u64));
         let amount_coin_b_out = 0;
-
         let (coin_a_out, coin_b_out) = swap(
             coin_a_in,
             amount_coin_a_out, 
