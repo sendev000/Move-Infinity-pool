@@ -487,8 +487,8 @@ module lp_account::liquidity_pool {
         let lp_coins_total_supply = *option::borrow(&coin::supply<LPCoin<CoinA, CoinB>>());
         let amount_coin_a_reserve = coin::value(&liquidity_pool.coin_a_reserve);        
         let amount_coin_b_reserve = coin::value(&liquidity_pool.coin_b_reserve);
-        let amount_coin_a = ((lp_coins_to_redeem_value as u128) * (amount_coin_a_reserve as u128)/ lp_coins_total_supply as u64);
-        let amount_coin_b = ((lp_coins_to_redeem_value as u128) * (amount_coin_b_reserve as u128)/ lp_coins_total_supply as u64);
+        let amount_coin_a = math64::mul_div(lp_coins_to_redeem_value, amount_coin_a_reserve, (lp_coins_total_supply as u64));
+        let amount_coin_b = math64::mul_div(lp_coins_to_redeem_value, amount_coin_b_reserve, (lp_coins_total_supply as u64));
 
         coin::burn<LPCoin<CoinA, CoinB>>(lp_coins_to_redeem, &liquidity_pool.lp_coin_burn_cap);
         let coin_a = coin::extract(&mut liquidity_pool.coin_a_reserve, amount_coin_a);
